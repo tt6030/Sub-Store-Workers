@@ -23,6 +23,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # ★ 修复：把 BARK_KEY 提到 job 级 env，step 的 if 才能正确判断
+    env:
+      BARK_KEY: ${{ secrets.BARK_KEY }}
 
     steps:
       - name: Checkout sub-store-workers
@@ -207,6 +210,8 @@ jobs:
           cp dist/quickjs.wasm pages-dist/quickjs.wasm
 
       - name: Ensure Pages project exists (Direct Upload)
+        # ★ 修复：加上 needed 条件，避免无更新时也去调用 API
+        if: steps.check.outputs.needed == 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -216,12 +221,13 @@ jobs:
 
       - name: Deploy Pages
         if: steps.check.outputs.needed == 'true'
-        # working-directory: sub-store-workers
+        # ★ 修复：保持在仓库根目录运行（不设 working-directory），
+        #   并把部署路径改为相对于仓库根目录的 sub-store-workers/pages-dist
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
         run: |
-          npx wrangler pages deploy pages-dist \
+          npx wrangler pages deploy sub-store-workers/pages-dist \
             --project-name "${{ secrets.PAGES_PROJECT_NAME }}" \
             --branch main \
             --commit-message "upstream ${{ steps.upstream.outputs.version }}" \
@@ -258,7 +264,7 @@ jobs:
             echo "::warning::Failed to set Pages environment variables: $(echo "$RESP" | jq -r '.errors // []')"
           fi
 
-      - name: Health check
+      - name: Health check (Workers)
         if: steps.check.outputs.needed == 'true'
         run: |
           URL="https://sub-store-workers.${{ secrets.WORKERS_SUBDOMAIN }}.workers.dev"
@@ -272,6 +278,23 @@ jobs:
             fi
           done
           echo "Worker health check failed"
+          exit 1
+
+      # ★ 新增：Pages 健康检查，确认 pages.dev 可访问
+      - name: Health check (Pages)
+        if: steps.check.outputs.needed == 'true'
+        run: |
+          URL="https://${{ secrets.PAGES_PROJECT_NAME }}.pages.dev"
+          for i in 1 2 3; do
+            sleep 10
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "$URL/")
+            echo "Attempt $i: HTTP $CODE"
+            if [ "$CODE" = "200" ] || [ "$CODE" = "302" ] || [ "$CODE" = "404" ]; then
+              echo "Pages is alive"
+              exit 0
+            fi
+          done
+          echo "Pages health check failed"
           exit 1
 
       - name: Write job summary
@@ -306,8 +329,6 @@ jobs:
 
       - name: Bark notify success
         if: steps.check.outputs.needed == 'true' && success() && env.BARK_KEY != ''
-        env:
-          BARK_KEY: ${{ secrets.BARK_KEY }}
         run: |
           TITLE=$(printf 'Sub-Store %%E5%%B7%%B2%%E6%%9B%%B4%%E6%%96%%B0' | sed 's/%%/%/g')
           curl -s "https://api.day.app/${BARK_KEY}/Sub-Store%20${{ steps.upstream.outputs.version }}/Workers%20%2B%20Pages%20deployed"
@@ -315,7 +336,6 @@ jobs:
       - name: Bark notify failure
         if: failure() && env.BARK_KEY != ''
         env:
-          BARK_KEY: ${{ secrets.BARK_KEY }}
           UPSTREAM_VERSION: ${{ steps.upstream.outputs.version }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
